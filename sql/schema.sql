@@ -4,6 +4,12 @@
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
+-- Extensions (required for trigram text search and GIN index support)
+-- ---------------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS btree_gin;
+
+-- ---------------------------------------------------------------------------
 -- ETL audit (created first so loaders can write to it immediately)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS etl_audit (
@@ -43,9 +49,11 @@ CREATE TABLE IF NOT EXISTS dim_drug (
     drug_name_normalized    TEXT,                   -- UPPER TRIM for joins
     rxcui                   TEXT,
     atc_code                TEXT,
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT uq_drug_ndc UNIQUE (ndc11)           -- partial unique enforced by ETL
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Partial unique index on ndc11 (NULL rows are excluded, allowing multiple NULLs)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_drug_ndc ON dim_drug(ndc11) WHERE ndc11 IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_drug_normalized ON dim_drug (drug_name_normalized);
 CREATE INDEX IF NOT EXISTS idx_drug_brnd       ON dim_drug USING gin (brnd_name gin_trgm_ops);
@@ -60,7 +68,8 @@ CREATE TABLE IF NOT EXISTS dim_plan (
     organization_type       TEXT,
     parent_org              TEXT,
     part_d_flag             BOOLEAN      DEFAULT TRUE,
-    service_area_states     TEXT[]                      -- array of state abbrs
+    service_area_states     TEXT[],                    -- array of state abbrs
+    snp                     TEXT                       -- SNP type from SPUF PlanInfo
 );
 
 CREATE INDEX IF NOT EXISTS idx_plan_contract  ON dim_plan (contract_id);
@@ -73,7 +82,7 @@ CREATE TABLE IF NOT EXISTS dim_geography (
     state_name      TEXT,
     county_name     TEXT,
     county_fips     CHAR(5),
-    geo_level       VARCHAR(10)  NOT NULL CHECK (geo_level IN ('state','county')),
+    geo_level       VARCHAR(10)  NOT NULL CHECK (geo_level IN ('state','county','national')),
     CONSTRAINT uq_geo_state_county UNIQUE (state_abbr, county_fips)
 );
 
@@ -87,47 +96,63 @@ CREATE TABLE IF NOT EXISTS dim_prescriber_specialty (
 );
 
 -- ---------------------------------------------------------------------------
+-- Bridge: dim_formulary (links formulary_id to plans; one formulary → many plans)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dim_formulary (
+    formulary_id    VARCHAR(8)  NOT NULL,
+    plan_id         INT         NOT NULL REFERENCES dim_plan(plan_id),
+    PRIMARY KEY (formulary_id, plan_id)
+);
+
+-- ---------------------------------------------------------------------------
 -- Facts
 -- ---------------------------------------------------------------------------
 
--- Formulary coverage  (grain: plan × NDC × period)
+-- Formulary coverage  (grain: formulary_id × NDC × period)
 CREATE TABLE IF NOT EXISTS fact_formulary_coverage (
-    formulary_id        BIGSERIAL PRIMARY KEY,
-    plan_id             INT          NOT NULL REFERENCES dim_plan(plan_id),
+    coverage_id         BIGSERIAL PRIMARY KEY,
+    formulary_id        VARCHAR(8)   NOT NULL,       -- references dim_formulary implicitly
     drug_id             INT          REFERENCES dim_drug(drug_id),  -- NULL if NDC unmatched
     period_id           INT          NOT NULL REFERENCES dim_period(period_id),
+    rxcui               CHAR(8),
     tier_level_value    SMALLINT,
     prior_auth_yn       BOOLEAN,
     step_therapy_yn     BOOLEAN,
     quantity_limit_yn   BOOLEAN,
-    quantity_limit_detail TEXT,
-    formulary_status    SMALLINT,
-    ndc11_raw           CHAR(11)     -- raw NDC before dim_drug lookup
+    qty_limit_amount    SMALLINT,
+    qty_limit_days      SMALLINT,
+    selected_drug_yn    BOOLEAN,
+    formulary_version   SMALLINT,
+    contract_year       SMALLINT
 );
 
-CREATE INDEX IF NOT EXISTS idx_fcov_plan    ON fact_formulary_coverage (plan_id);
-CREATE INDEX IF NOT EXISTS idx_fcov_drug    ON fact_formulary_coverage (drug_id);
-CREATE INDEX IF NOT EXISTS idx_fcov_period  ON fact_formulary_coverage (period_id);
-CREATE INDEX IF NOT EXISTS idx_fcov_tier    ON fact_formulary_coverage (tier_level_value);
-CREATE INDEX IF NOT EXISTS idx_fcov_pa      ON fact_formulary_coverage (prior_auth_yn);
+CREATE INDEX IF NOT EXISTS idx_fcov_formulary ON fact_formulary_coverage (formulary_id);
+CREATE INDEX IF NOT EXISTS idx_fcov_drug      ON fact_formulary_coverage (drug_id);
+CREATE INDEX IF NOT EXISTS idx_fcov_period    ON fact_formulary_coverage (period_id);
+CREATE INDEX IF NOT EXISTS idx_fcov_tier      ON fact_formulary_coverage (tier_level_value);
+CREATE INDEX IF NOT EXISTS idx_fcov_pa        ON fact_formulary_coverage (prior_auth_yn);
 
--- Drug spend  (grain: drug × year)
+-- Drug spend  (grain: drug × manufacturer × year)
 CREATE TABLE IF NOT EXISTS fact_drug_spend (
     spend_id                    BIGSERIAL PRIMARY KEY,
     drug_id                     INT          REFERENCES dim_drug(drug_id),
     period_id                   INT          NOT NULL REFERENCES dim_period(period_id),
-    tot_mftr_name               TEXT,
+    year                        SMALLINT     NOT NULL,
+    mftr_name                   TEXT,
     tot_spndng                  NUMERIC(18,2),
     tot_dsg_unts                BIGINT,
     tot_clms                    BIGINT,
     tot_benes                   INT,
     avg_spnd_per_clm            NUMERIC(12,4),
     avg_spnd_per_dsg_unt_wghtd  NUMERIC(12,6),
+    avg_spnd_per_bene           NUMERIC(12,4),
+    outlier_flag                BOOLEAN,
     bene_suppression_flag       BOOLEAN DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_spend_drug    ON fact_drug_spend (drug_id);
 CREATE INDEX IF NOT EXISTS idx_spend_period  ON fact_drug_spend (period_id);
+CREATE INDEX IF NOT EXISTS idx_spend_year    ON fact_drug_spend (year);
 
 -- Prescriber × Drug  (grain: NPI × drug name × year)
 CREATE TABLE IF NOT EXISTS fact_prescriber_drug (
@@ -159,16 +184,31 @@ CREATE INDEX IF NOT EXISTS idx_pd_geo      ON fact_prescriber_drug (geo_id);
 CREATE INDEX IF NOT EXISTS idx_pd_period   ON fact_prescriber_drug (period_id);
 CREATE INDEX IF NOT EXISTS idx_pd_spec     ON fact_prescriber_drug (specialty_id);
 
--- Geography × Drug  (grain: state × drug name × year)
+-- Geography × Drug  (grain: state/national × drug name × year)
 CREATE TABLE IF NOT EXISTS fact_geo_drug (
-    geo_drug_id     BIGSERIAL PRIMARY KEY,
-    geo_id          INT          NOT NULL REFERENCES dim_geography(geo_id),
-    drug_id         INT          REFERENCES dim_drug(drug_id),
-    period_id       INT          NOT NULL REFERENCES dim_period(period_id),
-    tot_prscrbrs    INT,
-    tot_clms        BIGINT,
-    tot_drug_cst    NUMERIC(18,2),
-    tot_benes       INT
+    geo_drug_id             BIGSERIAL PRIMARY KEY,
+    geo_id                  INT          NOT NULL REFERENCES dim_geography(geo_id),
+    drug_id                 INT          REFERENCES dim_drug(drug_id),
+    period_id               INT          NOT NULL REFERENCES dim_period(period_id),
+    brnd_name               TEXT,
+    gnrc_name               TEXT,
+    tot_prscrbrs            INT,
+    tot_clms                BIGINT,
+    tot_30day_fills         NUMERIC(12,1),
+    tot_drug_cst            NUMERIC(18,2),
+    tot_benes               INT,
+    ge65_sprsn_flag         CHAR(1),
+    ge65_tot_clms           BIGINT,
+    ge65_tot_30day_fills    NUMERIC(12,1),
+    ge65_tot_drug_cst       NUMERIC(18,2),
+    ge65_bene_sprsn_flag    CHAR(1),
+    ge65_tot_benes          INT,
+    lis_bene_cst_shr        NUMERIC(14,2),
+    nonlis_bene_cst_shr     NUMERIC(14,2),
+    opioid_drug_flag        BOOLEAN,
+    opioid_la_drug_flag     BOOLEAN,
+    antbtc_drug_flag        BOOLEAN,
+    antpsyct_drug_flag      BOOLEAN
 );
 
 CREATE INDEX IF NOT EXISTS idx_gd_geo     ON fact_geo_drug (geo_id);
@@ -181,6 +221,7 @@ CREATE TABLE IF NOT EXISTS fact_enrollment (
     plan_id             INT          REFERENCES dim_plan(plan_id),
     geo_id              INT          REFERENCES dim_geography(geo_id),
     period_id           INT          NOT NULL REFERENCES dim_period(period_id),
+    ssa_county_code     CHAR(5),
     enrollment          INT,          -- NULL when masked ('*')
     enrollment_masked   BOOLEAN      DEFAULT FALSE
 );
