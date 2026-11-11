@@ -1,0 +1,55 @@
+# === Raw downloads and large data ===
+datasets/
+parquet/
+*.parquet
+*.zip
+*.csv.gz
+
+# === Secrets ===
+.env
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+env/
+ENV/
+*.pyc
+
+# === Jupyter ===
+.ipynb_checkpoints/
+*.ipynb~
+
+# === ML artefacts (keep only small committed models) ===
+models/*.pkl
+models/*.joblib
+models/*.xgb
+models/*.json
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === IDEs ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Logs ===
+*.log
+logs/
+
+# === Docker ===
+docker-data/
+postgres-data/
