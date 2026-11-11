@@ -53,3 +53,5 @@ logs/
 # === Docker ===
 docker-data/
 postgres-data/
+
+datasets/
